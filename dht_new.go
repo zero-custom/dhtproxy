@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,7 +20,10 @@ type backendStats struct {
 	name     string
 	requests *int64
 	peers    *int64
-	stop     chan struct{}
+	// extra appends to the stats line when non-nil and non-empty
+	// (e.g. routing table sizes); nil keeps the original line format.
+	extra func() string
+	stop  chan struct{}
 }
 
 func startBackendStats(name string, requests, peers *int64) *backendStats {
@@ -34,8 +38,14 @@ func (s *backendStats) loop() {
 	for {
 		select {
 		case <-t.C:
-			log.Printf("dht backend stats backend=%s requests=%d peers=%d",
+			line := fmt.Sprintf("dht backend stats backend=%s requests=%d peers=%d",
 				s.name, atomic.LoadInt64(s.requests), atomic.LoadInt64(s.peers))
+			if s.extra != nil {
+				if extra := s.extra(); extra != "" {
+					line += " " + extra
+				}
+			}
+			log.Print(line)
 		case <-s.stop:
 			return
 		}
@@ -77,6 +87,40 @@ func compactPeersFromNodeAddrs(peers []adht.Peer) []string {
 	return out
 }
 
+// compactPeer6FromNodeAddr encodes one 18-byte compact peer (IPv6 +
+// big-endian port, BEP 7) from an anacrolix peer. It reports false for
+// invalid ports and non-IPv6 addresses: IPv4 and IPv4-mapped IPv6 stay on
+// the v4 path so families never double-count the same peer.
+func compactPeer6FromNodeAddr(ip net.IP, port int) (string, bool) {
+	if port <= 0 || port > 65535 {
+		return "", false
+	}
+	if ip.To4() != nil {
+		return "", false
+	}
+	ip16 := ip.To16()
+	if ip16 == nil {
+		return "", false
+	}
+	b := make([]byte, 18)
+	copy(b, ip16)
+	b[16] = byte(port >> 8)
+	b[17] = byte(port)
+	return string(b), true
+}
+
+// compactPeers6FromNodeAddrs converts one get_peers batch, dropping peers
+// that have no compact IPv6 form. Pure function, safe to unit test.
+func compactPeers6FromNodeAddrs(peers []adht.Peer) []string {
+	out := make([]string, 0, len(peers))
+	for _, p := range peers {
+		if s, ok := compactPeer6FromNodeAddr(p.IP, p.Port); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // maxConcurrentNewTraversals bounds distinct-infohash AnnounceTraversal
 // operations in flight on the new backend. Shared-infohash load fans out to
 // thousands of Requests; without a cap each one held a minute-long
@@ -85,31 +129,100 @@ func compactPeersFromNodeAddrs(peers []adht.Peer) []string {
 // the tracker's poll picks them up for all waiters.
 const maxConcurrentNewTraversals = 32
 
+// dht6BootstrapHostPorts is the bootstrap pool the DHT6 server resolves at
+// startup: the anacrolix library's DefaultGlobalBootstrapHostPorts
+// (dht.go), filtered to IPv6-capable addrs below. router.silotis.us is that
+// list's documented IPv6 anchor; the remaining defaults are IPv4-only and
+// are dropped by the filter. Kept as a var so tests and operators can
+// override it without touching the library (MPL-2.0: consume unmodified).
+var dht6BootstrapHostPorts = adht.DefaultGlobalBootstrapHostPorts
+
+// filterDHT6Addrs keeps only IPv6-capable addrs for the DHT6 server.
+// Pure function, safe to unit test.
+func filterDHT6Addrs(addrs []adht.Addr) []adht.Addr {
+	v6 := make([]adht.Addr, 0, len(addrs))
+	for _, a := range addrs {
+		ip := a.IP()
+		if ip == nil || ip.To4() != nil || ip.To16() == nil {
+			continue
+		}
+		v6 = append(v6, a)
+	}
+	return v6
+}
+
+// resolveDHT6StartingNodes resolves hostPorts and filters to IPv6-capable
+// bootstrap addrs. Zero-result is a degrade signal (skip v6), never fatal.
+func resolveDHT6StartingNodes(hostPorts []string) ([]adht.Addr, error) {
+	addrs, err := adht.ResolveHostPorts(hostPorts)
+	if err != nil {
+		return nil, err
+	}
+	v6 := filterDHT6Addrs(addrs)
+	if len(v6) == 0 {
+		return nil, fmt.Errorf("no IPv6 bootstrap addrs resolved from %d hosts", len(hostPorts))
+	}
+	return v6, nil
+}
+
+// startDHT6Server builds the second anacrolix Server for the DHT6 network:
+// own udp6 socket (ephemeral port, one socket per port), fresh NodeId (never
+// shared with the v4 server), IPv6-filtered StartingNodes resolved at
+// startup. The caller owns TableMaintainer + Close wiring. It returns
+// (nil, err) on v4-only hosts (no IPv6 socket) or unresolvable bootstrap;
+// the caller degrades to v4-only, never failing startup or a request.
+func startDHT6Server() (*adht.Server, error) {
+	conn, err := net.ListenPacket("udp6", ":0")
+	if err != nil {
+		return nil, fmt.Errorf("listen udp6 :0: %w", err)
+	}
+	nodes, err := resolveDHT6StartingNodes(dht6BootstrapHostPorts)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	log.Printf("new DHT backend: DHT6 bootstrap addrs=%d %v", len(nodes), nodes)
+	cfg := adht.NewDefaultServerConfig()
+	cfg.Conn = conn
+	cfg.NodeId = adht.RandomNodeID() // fresh identity: one Server, one network.
+	cfg.StartingNodes = func() ([]adht.Addr, error) { return nodes, nil }
+	srv, err := adht.NewServer(cfg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("new v6 server: %w", err)
+	}
+	return srv, nil
+}
+
 // traversalStarter starts one discovery round for ih and returns its peer
 // batch stream plus an idempotent close func. It is a field (not a direct
 // AnnounceTraversal call) so tests can stub it without UDP or the library.
 type traversalStarter func(ih [20]byte) (peers <-chan adht.PeersValues, close func(), err error)
 
 // newBackend is the anacrolix/dht PeerBackend. Each Request starts one
-// AnnounceTraversal in the background and forwards every PeersValues batch
-// into the shared peercache; the tracker picks results up via its cache
-// poll, exactly like the old backend. Concurrent traversals are singleflight
-// per infohash (duplicate Requests share the in-flight one via the shared
-// cache) and bounded by maxConcurrentNewTraversals; excess Requests are
-// skipped, never queued.
+// AnnounceTraversal per family (v4, plus v6 when the DHT6 server started)
+// in the background and forwards every PeersValues batch into the shared
+// peercache; the tracker picks results up via its cache poll, exactly like
+// the old backend. Concurrent traversals are singleflight per infohash
+// (duplicate Requests share the in-flight ones via the shared cache) and
+// bounded by maxConcurrentNewTraversals, one budget shared across families,
+// not doubled; excess Requests are skipped, never queued.
 type newBackend struct {
 	server         *adht.Server
+	server6        *adht.Server // nil on v4-only hosts: v6 skipped, v4 byte-identical.
 	cache          *peercache.Cache
 	requestTimeout time.Duration
 	requests       int64
-	returnedPeers  int64
+	returnedPeers  int64 // covers v4+v6 together (one counter, see runTraversal).
 	stats          *backendStats
 	starter        traversalStarter
+	starter6       traversalStarter // nil when server6 is nil; same seam as v4.
 
-	mu          sync.Mutex
-	active      map[[20]byte]struct{}
-	sem         chan struct{}
-	lastSkipLog time.Time
+	mu           sync.Mutex
+	active       map[[20]byte]struct{}
+	sem          chan struct{}
+	lastSkipLog  time.Time
+	lastV6ErrLog time.Time
 }
 
 func (b *newBackend) Name() string { return "new" }
@@ -142,13 +255,47 @@ func NewNewBackend(port int, requestTimeout time.Duration, c *peercache.Cache) (
 	}
 	b.starter = b.startRealTraversal
 	b.stats = startBackendStats("new", &b.requests, &b.returnedPeers)
+	b.stats.extra = b.tableSummary
 
 	log.Printf("new DHT backend started port=%d requestTimeout=%s maxTraversals=%d",
 		port, b.effectiveTimeout(), maxConcurrentNewTraversals)
 
 	go srv.TableMaintainer()
 
+	// DHT6 (Variant A: second Server): degrade to v4-only when there is no
+	// IPv6 socket or no AAAA bootstrap. One line at startup, never fatal,
+	// never per-request; v4 behavior stays byte-identical.
+	if srv6, err := startDHT6Server(); err != nil {
+		log.Print("new DHT backend: DHT6 disabled: ", err)
+	} else {
+		b.server6 = srv6
+		b.starter6 = b.startRealTraversal6
+		log.Printf("new DHT backend: DHT6 enabled addr=%s", srv6.Addr())
+		go srv6.TableMaintainer()
+	}
+
 	return b, nil
+}
+
+// tableSize renders one routing table size for the stats line; "off"
+// means that family has no server (v6 degrade path). NumNodes locks
+// internally, so this is safe to call from the stats goroutine.
+func tableSize(srv *adht.Server) string {
+	if srv == nil {
+		return "off"
+	}
+	return strconv.Itoa(srv.NumNodes())
+}
+
+// tableSummary reports both routing tables for the per-minute stats
+// line, so an empty v6 table (dead bootstrap) is distinguishable from
+// missing observability. Empty only when neither server exists.
+func (b *newBackend) tableSummary() string {
+	if b.server == nil && b.server6 == nil {
+		return ""
+	}
+	return fmt.Sprintf("table4=%s table6=%s",
+		tableSize(b.server), tableSize(b.server6))
 }
 
 // effectiveTimeout is the per-traversal bound, defaulting to one minute.
@@ -159,9 +306,20 @@ func (b *newBackend) effectiveTimeout() time.Duration {
 	return b.requestTimeout
 }
 
-// startRealTraversal runs one AnnounceTraversal against the live server.
+// startRealTraversal runs one AnnounceTraversal against the live v4 server.
 func (b *newBackend) startRealTraversal(ih [20]byte) (<-chan adht.PeersValues, func(), error) {
 	a, err := b.server.AnnounceTraversal(ih)
+	if err != nil {
+		return nil, nil, err
+	}
+	return a.Peers, a.Close, nil
+}
+
+// startRealTraversal6 runs one AnnounceTraversal against the live DHT6
+// server. Only wired as starter6 when server6 started; nil server6 means no
+// v6 discovery at all.
+func (b *newBackend) startRealTraversal6(ih [20]byte) (<-chan adht.PeersValues, func(), error) {
+	a, err := b.server6.AnnounceTraversal(ih)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -206,9 +364,31 @@ func (b *newBackend) lookup(ih [20]byte, timeout time.Duration) {
 		<-b.sem
 	}()
 
-	peersCh, closeFn, err := b.starter(ih)
+	// One sem slot and one singleflight entry cover both families: v4+v6
+	// fan out under the shared budget, never doubling it.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		b.runTraversal(ih, b.starter, timeout, false)
+	}()
+	if b.starter6 != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b.runTraversal(ih, b.starter6, timeout, true)
+		}()
+	}
+	wg.Wait()
+}
+
+// runTraversal runs one discovery round and forwards compact batches into
+// the shared peercache. v6 converts to 18-byte entries; v4 stays 6-byte.
+// Errors and timeouts are warnings only, never fatal.
+func (b *newBackend) runTraversal(ih [20]byte, starter traversalStarter, timeout time.Duration, v6 bool) {
+	peersCh, closeFn, err := starter(ih)
 	if err != nil {
-		log.Print("new DHT backend: announce: ", err)
+		b.logTraversalErr(err, v6)
 		return
 	}
 	// Bound the discovery round: closing the traversal ends the Peers
@@ -218,12 +398,36 @@ func (b *newBackend) lookup(ih [20]byte, timeout time.Duration) {
 	defer closeFn()
 
 	for pv := range peersCh {
-		compacts := compactPeersFromNodeAddrs(pv.Peers)
+		var compacts []string
+		if v6 {
+			compacts = compactPeers6FromNodeAddrs(pv.Peers)
+		} else {
+			compacts = compactPeersFromNodeAddrs(pv.Peers)
+		}
 		if len(compacts) == 0 {
 			continue
 		}
-		atomic.AddInt64(&b.returnedPeers, int64(len(compacts)))
+		atomic.AddInt64(&b.returnedPeers, int64(len(compacts))) // returnedPeers covers v4+v6 together.
 		b.cache.Add(string(ih[:]), compacts)
+	}
+}
+
+// logTraversalErr warns on discovery failure. v4 logs every failure (as
+// before); v6 failures are throttled to one line per minute so v4-only
+// hosts don't spam the log while v4 keeps serving from cache.
+func (b *newBackend) logTraversalErr(err error, v6 bool) {
+	if !v6 {
+		log.Print("new DHT backend: announce: ", err)
+		return
+	}
+	b.mu.Lock()
+	throttled := time.Since(b.lastV6ErrLog) < time.Minute
+	if !throttled {
+		b.lastV6ErrLog = time.Now()
+	}
+	b.mu.Unlock()
+	if !throttled {
+		log.Print("new DHT backend (v6): announce: ", err)
 	}
 }
 
@@ -232,7 +436,19 @@ func (b *newBackend) Close() error {
 		b.stats.close()
 		b.stats = nil
 	}
-	b.server.Close()
+	// NOTE: server pointers are intentionally NOT nilled. In-flight
+	// lookups read b.server/b.server6 via the starter methods without
+	// holding mu; nil-ing here would race with those reads (nil deref
+	// panic, and -race read/write report). Server.Close is idempotent
+	// (mutex + atomic closed flag), so double Close is safe, and a
+	// post-Close Request degrades to a logged traversal error, never a
+	// panic.
+	if b.server != nil {
+		b.server.Close()
+	}
+	if b.server6 != nil {
+		b.server6.Close()
+	}
 	return nil
 }
 

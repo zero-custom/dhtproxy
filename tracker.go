@@ -13,38 +13,57 @@ import (
 )
 
 type TrackerResponse struct {
-	Interval    int64  "interval"     //nolint:govet // Bencode-go uses non-comformant struct tags
-	MinInterval int64  "min interval" //nolint:govet // Bencode-go uses non-comformant struct tags
-	Complete    int    "complete"     //nolint:govet // Bencode-go uses non-comformant struct tags
-	Incomplete  int    "incomplete"   //nolint:govet // Bencode-go uses non-comformant struct tags
-	Peers       string "peers"        //nolint:govet // Bencode-go uses non-comformant struct tags
+	Interval    int64  "interval"                   //nolint:govet // Bencode-go uses non-comformant struct tags
+	MinInterval int64  "min interval"               //nolint:govet // Bencode-go uses non-comformant struct tags
+	Complete    int    "complete"                   //nolint:govet // Bencode-go uses non-comformant struct tags
+	Incomplete  int    "incomplete"                 //nolint:govet // Bencode-go uses non-comformant struct tags
+	Peers       string "peers"                      //nolint:govet // Bencode-go uses non-comformant struct tags
+	Peers6      string `bencode:"peers6,omitempty"` // Omitted when empty so v4-only swarms stay byte-identical.
 }
 
-// ipv6Skipped counts announces whose source address is not IPv4 and were
-// therefore not recorded in the local pool. Read with atomic.LoadInt64.
+// ipv6Skipped counts announces that could not be recorded in the local pool
+// because the source address or port was unusable (unparseable host,
+// non-IP host, or port outside 1-65535). Successfully recorded IPv6
+// announces are not counted. Read with atomic.LoadInt64.
 var ipv6Skipped int64
 
-// compactPeerFromAddr encodes a 6-byte compact peer (IPv4 + big-endian
-// port) from a connection RemoteAddr and an announce port. It reports false
-// when the port is invalid or the address is not IPv4; callers then serve
-// DHT results only.
+// compactPeerFromAddr encodes a compact peer from a connection RemoteAddr
+// and an announce port: 6 bytes (IPv4 + big-endian port) for IPv4 sources,
+// 18 bytes (16-byte IPv6 + big-endian port, BEP 7) for IPv6 sources
+// (bracket form included — net.SplitHostPort already handles it). It
+// reports false when the port is invalid or the host is unusable; callers
+// then serve DHT results only.
 func compactPeerFromAddr(remoteAddr string, port int) (string, bool) {
 	if port <= 0 || port > 65535 {
+		atomic.AddInt64(&ipv6Skipped, 1)
 		return "", false
 	}
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		return "", false
-	}
-	ip4 := net.ParseIP(host).To4()
-	if ip4 == nil {
 		atomic.AddInt64(&ipv6Skipped, 1)
 		return "", false
 	}
-	b := make([]byte, 6)
-	copy(b, ip4)
-	b[4] = byte(port >> 8)
-	b[5] = byte(port)
+	ip := net.ParseIP(host)
+	if ip == nil {
+		atomic.AddInt64(&ipv6Skipped, 1)
+		return "", false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		b := make([]byte, 6)
+		copy(b, ip4)
+		b[4] = byte(port >> 8)
+		b[5] = byte(port)
+		return string(b), true
+	}
+	ip16 := ip.To16()
+	if ip16 == nil {
+		atomic.AddInt64(&ipv6Skipped, 1)
+		return "", false
+	}
+	b := make([]byte, 18)
+	copy(b, ip16)
+	b[16] = byte(port >> 8)
+	b[17] = byte(port)
 	return string(b), true
 }
 
@@ -60,6 +79,40 @@ func truncatePeers(peers []string, numwant, maxWant int) []string {
 		limit = numwant
 	}
 	return peers[:limit]
+}
+
+// splitPeers partitions a merged peer list by compact-entry length: 6-byte
+// entries go to v4 (peers), 18-byte entries to v6 (peers6, BEP 7). Entries
+// of any other length are dropped defensively.
+func splitPeers(peers []string) (v4, v6 []string) {
+	for _, p := range peers {
+		switch len(p) {
+		case 6:
+			v4 = append(v4, p)
+		case 18:
+			v6 = append(v6, p)
+		}
+	}
+	return v4, v6
+}
+
+// truncateSplitPeers partitions the merged list and caps both halves against
+// a shared numwant budget, v4 filled first; each half is additionally capped
+// by maxWant. A v4-only input yields exactly the truncatePeers output, so
+// pre-IPv6 swarms respond byte-identically.
+func truncateSplitPeers(peers []string, numwant, maxWant int) (v4, v6 []string) {
+	v4all, v6all := splitPeers(peers)
+	v4 = truncatePeers(v4all, numwant, maxWant)
+	if numwant <= 0 {
+		v6 = truncatePeers(v6all, 0, maxWant)
+		return v4, v6
+	}
+	budget := numwant - len(v4)
+	if budget <= 0 {
+		return v4, nil
+	}
+	v6 = truncatePeers(v6all, budget, maxWant)
+	return v4, v6
 }
 
 // recordAnnounce folds one client's announce into the local pool so later
@@ -132,9 +185,10 @@ func trackerHandler(w http.ResponseWriter, r *http.Request) {
 
 	if ok && len(peers) > 0 {
 		numwant, _ := strconv.Atoi(r.FormValue("numwant"))
-		peers = truncatePeers(peers, numwant, *maxWant)
-		response.Incomplete = len(peers)
-		response.Peers = strings.Join(peers, "")
+		v4, v6 := truncateSplitPeers(peers, numwant, *maxWant)
+		response.Incomplete = len(v4) + len(v6)
+		response.Peers = strings.Join(v4, "")
+		response.Peers6 = strings.Join(v6, "")
 	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
