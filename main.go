@@ -18,6 +18,7 @@ var (
 	targetNumPeers   = flag.Int("targetNumPeers", 8, "The number of DHT peers to try to find for a given node")
 	peerCacheSize    = flag.Int("peerCacheSize", 16384, "The max number of infohashes to keep a list of peers for.")
 	maxWant          = flag.Int("maxWant", 200, "The largest number of peers to return in one request.")
+	poolTTL          = flag.Duration("poolTTL", 30*time.Minute, "How long locally announced peers are kept (0 = disable the local pool, DHT-only behavior).")
 
 	peerCache *peercache.Cache
 	dhtNode   *DhtNode
@@ -29,7 +30,7 @@ func main() {
 	setRlimitFromFlags()
 
 	var err error
-	peerCache, err = peercache.New(*peerCacheSize, *maxWant)
+	peerCache, err = peercache.NewWithTTL(*peerCacheSize, *maxWant, *poolTTL)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -1,10 +1,12 @@
 package peercache
 
 import (
+	"fmt"
 	"math/rand"
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -99,4 +101,106 @@ func testRaceWorker(c *Cache) {
 
 func randKey(n int32) string {
 	return strconv.Itoa(int(rand.Int31n(n)))
+}
+
+func TestUpsertDelete(t *testing.T) {
+	c, err := New(10, 4)
+	assert.NoError(t, err)
+	defer c.Close()
+
+	c.Upsert("ih", "peer1", 100)
+	peers, ok := c.Get("ih")
+	if assert.True(t, ok) {
+		assert.Equal(t, []string{"peer1"}, peers)
+	}
+
+	c.Upsert("ih", "peer2", 0)
+	peers, ok = c.Get("ih")
+	if assert.True(t, ok) {
+		assert.Equal(t, []string{"peer1", "peer2"}, peers)
+	}
+
+	// Refreshing an existing peer keeps a single entry.
+	c.Upsert("ih", "peer1", 0)
+	peers, ok = c.Get("ih")
+	if assert.True(t, ok) {
+		assert.Equal(t, []string{"peer1", "peer2"}, peers)
+	}
+
+	c.Delete("ih", "peer1")
+	peers, ok = c.Get("ih")
+	if assert.True(t, ok) {
+		assert.Equal(t, []string{"peer2"}, peers)
+	}
+
+	// Deleting the last peer drops the key.
+	c.Delete("ih", "peer2")
+	_, ok = c.Get("ih")
+	assert.False(t, ok)
+
+	// Deleting a missing key is a no-op.
+	c.Delete("ih", "peer2")
+	c.Delete("missing", "peer2")
+}
+
+func TestTTLExpiry(t *testing.T) {
+	c, err := NewWithTTL(10, 4, 60*time.Millisecond)
+	assert.NoError(t, err)
+	defer c.Close()
+
+	c.Upsert("ih", "peer1", 0)
+	_, ok := c.Get("ih")
+	assert.True(t, ok)
+
+	time.Sleep(150 * time.Millisecond)
+	_, ok = c.Get("ih")
+	assert.False(t, ok)
+}
+
+func TestAddExpiry(t *testing.T) {
+	c, err := NewWithTTL(10, 4, 60*time.Millisecond)
+	assert.NoError(t, err)
+	defer c.Close()
+
+	c.Add("ih", []string{"peer1"})
+	_, ok := c.Get("ih")
+	assert.True(t, ok)
+
+	time.Sleep(150 * time.Millisecond)
+	_, ok = c.Get("ih")
+	assert.False(t, ok)
+}
+
+func TestUpsertRefresh(t *testing.T) {
+
+	c, err := NewWithTTL(10, 4, 200*time.Millisecond)
+	assert.NoError(t, err)
+	defer c.Close()
+
+	c.Upsert("ih", "peer1", 5)
+	time.Sleep(100 * time.Millisecond)
+	c.Upsert("ih", "peer1", 0)
+	time.Sleep(100 * time.Millisecond)
+
+	// Age since refresh is ~100ms < 200ms TTL: still alive.
+	_, ok := c.Get("ih")
+	assert.True(t, ok)
+
+	time.Sleep(250 * time.Millisecond)
+	_, ok = c.Get("ih")
+	assert.False(t, ok)
+}
+
+func TestListLimit200(t *testing.T) {
+	c, err := New(10, 200)
+	assert.NoError(t, err)
+	defer c.Close()
+
+	for i := 0; i < 201; i++ {
+		c.Upsert("ih", fmt.Sprintf("peer-%03d", i), 0)
+	}
+	peers, ok := c.Get("ih")
+	if assert.True(t, ok) {
+		assert.Len(t, peers, 200)
+	}
 }
