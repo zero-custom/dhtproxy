@@ -1,14 +1,18 @@
 package main
 
 import (
+	"crypto/rand"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	adht "github.com/anacrolix/dht/v2"
+	"github.com/anacrolix/dht/v2/krpc"
 	"github.com/die-net/dhtproxy/peercache"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -113,61 +117,6 @@ func TestFilterDHT6Addrs(t *testing.T) {
 
 	assert.Empty(t, filterDHT6Addrs(nil))
 	assert.Empty(t, filterDHT6Addrs(addrs[:1]), "v4-only input keeps nothing")
-}
-
-// fakeBackend records fan-out without touching the network.
-type fakeBackend struct {
-	name       string
-	requests   [][20]byte
-	closeCalls int
-	closeErr   error
-}
-
-func (f *fakeBackend) Name() string { return f.name }
-
-func (f *fakeBackend) Request(ih [20]byte) { f.requests = append(f.requests, ih) }
-
-func (f *fakeBackend) Close() error {
-	f.closeCalls++
-	return f.closeErr
-}
-
-func TestBothBackendFanout(t *testing.T) {
-	a := &fakeBackend{name: "old"}
-	b := &fakeBackend{name: "new"}
-	m := &bothBackend{a: a, b: b}
-
-	assert.Equal(t, "both", m.Name())
-
-	var ih [20]byte
-	copy(ih[:], "0123456789abcdefghij")
-	m.Request(ih)
-
-	assert.Equal(t, [][20]byte{ih}, a.requests, "old backend must see the request")
-	assert.Equal(t, [][20]byte{ih}, b.requests, "new backend must see the request")
-
-	assert.NoError(t, m.Close())
-	assert.Equal(t, 1, a.closeCalls)
-	assert.Equal(t, 1, b.closeCalls)
-}
-
-func TestBothBackendCloseError(t *testing.T) {
-	a := &fakeBackend{name: "old", closeErr: errors.New("old boom")}
-	b := &fakeBackend{name: "new"}
-	m := &bothBackend{a: a, b: b}
-
-	err := m.Close()
-	if assert.Error(t, err) {
-		assert.Contains(t, err.Error(), "old boom")
-	}
-	assert.Equal(t, 1, b.closeCalls, "new backend must still close when old fails")
-}
-
-func TestNewPeerBackendUnknownMode(t *testing.T) {
-	_, err := newPeerBackend("bogus", 0, 8, 0, 0, nil)
-	if assert.Error(t, err) {
-		assert.Contains(t, err.Error(), "bogus")
-	}
 }
 
 // batchStarter returns a traversalStarter that emits one batch then ends,
@@ -523,4 +472,184 @@ func TestTableSummaryRealServers(t *testing.T) {
 func TestTableSummaryV6Off(t *testing.T) {
 	b := &newBackend{server: newRealServer(t, "udp", "127.0.0.1:0")}
 	assert.Equal(t, "table4=0 table6=off", b.tableSummary())
+}
+
+// stubNodesTable is an in-memory nodesTable: no UDP, no network. reject, when
+// non-nil, makes AddNode fail for matching entries so counting can be tested.
+type stubNodesTable struct {
+	nodes  []krpc.NodeInfo
+	reject func(krpc.NodeInfo) bool
+}
+
+func (s *stubNodesTable) Nodes() []krpc.NodeInfo {
+	return append([]krpc.NodeInfo(nil), s.nodes...)
+}
+
+func (s *stubNodesTable) AddNode(ni krpc.NodeInfo) error {
+	if s.reject != nil && s.reject(ni) {
+		return errors.New("stubNodesTable: rejected")
+	}
+	s.nodes = append(s.nodes, ni)
+	return nil
+}
+
+// testNodeInfo builds one routing-table entry with a fresh random ID.
+func testNodeInfo(t *testing.T, ip string, port int) krpc.NodeInfo {
+	t.Helper()
+	var id krpc.ID
+	_, err := rand.Read(id[:])
+	require.NoError(t, err)
+	parsed := net.ParseIP(ip)
+	require.NotNil(t, parsed, "bad test IP %q", ip)
+	return krpc.NodeInfo{ID: id, Addr: krpc.NodeAddr{IP: parsed, Port: port}}
+}
+
+func TestDeriveV6Path(t *testing.T) {
+	assert.Equal(t, "", deriveV6Path(""), "empty in means disabled: empty out")
+	assert.Equal(t, "/tmp/dht-nodes.dat.v6", deriveV6Path("/tmp/dht-nodes.dat"))
+	assert.Equal(t, "nodes.v6", deriveV6Path("nodes"))
+}
+
+// Save a mixed table, then load each family back: v4 keeps To4()!=nil, v6
+// keeps true-v6 only, so the v6 table can never be polluted with v4 entries.
+func TestSaveLoadNodesRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nodes.dat")
+	src := &stubNodesTable{}
+	for _, tc := range []struct {
+		ip   string
+		port int
+	}{
+		{"10.0.0.1", 6881},
+		{"10.0.0.2", 6882},
+		{"10.0.0.3", 6883},
+		{"2001:db8::1", 6881},
+		{"2001:db8::2", 6882},
+	} {
+		src.nodes = append(src.nodes, testNodeInfo(t, tc.ip, tc.port))
+	}
+
+	require.NoError(t, saveNodesAtomic(src, path))
+
+	fi, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, int64(38*5), fi.Size(), "38 bytes per record, no header")
+
+	entries, err := os.ReadDir(filepath.Dir(path))
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "atomic write must leave no temp files behind")
+	assert.Equal(t, "nodes.dat", entries[0].Name())
+
+	dst4 := &stubNodesTable{}
+	n4, err := loadNodes(dst4, path, false)
+	require.NoError(t, err)
+	assert.Equal(t, 3, n4)
+	require.Len(t, dst4.nodes, 3)
+	for _, ni := range dst4.nodes {
+		assert.NotNil(t, ni.Addr.IP.To4(), "v4 load keeps v4 entries only")
+	}
+
+	dst6 := &stubNodesTable{}
+	n6, err := loadNodes(dst6, path, true)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n6)
+	require.Len(t, dst6.nodes, 2)
+	for _, ni := range dst6.nodes {
+		assert.Nil(t, ni.Addr.IP.To4(), "v6 load keeps true-v6 entries only")
+	}
+}
+
+func TestLoadNodesMissingFile(t *testing.T) {
+	dst := &stubNodesTable{}
+	n, err := loadNodes(dst, filepath.Join(t.TempDir(), "does-not-exist.dat"), false)
+	assert.NoError(t, err, "missing file is a silent cold start")
+	assert.Equal(t, 0, n)
+	assert.Empty(t, dst.nodes)
+}
+
+func TestLoadNodesEmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty.dat")
+	require.NoError(t, os.WriteFile(path, nil, 0o600))
+	dst := &stubNodesTable{}
+	n, err := loadNodes(dst, path, false)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, n)
+}
+
+// A truncated tail loads the decodable prefix AND reports the read error,
+// so the caller warns and keeps running on the prefix instead of dying.
+func TestLoadNodesCorruptTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nodes.dat")
+	src := &stubNodesTable{}
+	for i := 0; i < 3; i++ {
+		src.nodes = append(src.nodes, testNodeInfo(t, "10.0.9.1", 6881+i))
+	}
+	require.NoError(t, saveNodesAtomic(src, path))
+
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, raw[:len(raw)-10], 0o600))
+
+	dst := &stubNodesTable{}
+	n, err := loadNodes(dst, path, false)
+	require.Error(t, err, "short tail must surface")
+	assert.Equal(t, 2, n, "prefix before the bad tail is still accepted")
+	assert.Len(t, dst.nodes, 2)
+}
+
+// AddNode rejections are skipped, not counted: the count is accepted entries.
+func TestLoadNodesCountsAccepted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nodes.dat")
+	src := &stubNodesTable{}
+	for _, port := range []int{6881, 6882, 6883} {
+		src.nodes = append(src.nodes, testNodeInfo(t, "10.0.0.1", port))
+	}
+	require.NoError(t, saveNodesAtomic(src, path))
+
+	dst := &stubNodesTable{reject: func(ni krpc.NodeInfo) bool {
+		return ni.Addr.Port == 6882
+	}}
+	n, err := loadNodes(dst, path, false)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+	assert.Len(t, dst.nodes, 2)
+}
+
+func TestSaveNodesAtomicErrors(t *testing.T) {
+	assert.Error(t, saveNodesAtomic(&stubNodesTable{}, ""),
+		"empty path must fail instead of writing somewhere surprising")
+	assert.Error(t, saveNodesAtomic(&stubNodesTable{},
+		filepath.Join(t.TempDir(), "no-such-dir", "nodes.dat")),
+		"unwritable directory must return, never fatal")
+}
+
+// Default-off: with no nodes file configured, SaveNodes is a nil no-op on
+// a zero backend, so today's behavior is byte-identical without the flag.
+func TestSaveNodesDisabledNoop(t *testing.T) {
+	assert.NoError(t, (&newBackend{}).SaveNodes())
+}
+
+// SaveNodes through live servers (bound loopback sockets, no TableMaintainer,
+// no network traffic): v4 and v6 tables land in their own files and reload
+// with the right family filter.
+func TestSaveNodesRealServers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nodes.dat")
+	b := &newBackend{
+		server:    newRealServer(t, "udp", "127.0.0.1:0"),
+		server6:   newRealServer(t, "udp6", "[::1]:0"),
+		nodesFile: path,
+	}
+	require.NoError(t, b.server.AddNode(testNodeInfo(t, "10.0.0.7", 6881)))
+	require.NoError(t, b.server6.AddNode(testNodeInfo(t, "2001:db8::7", 6881)))
+	require.NoError(t, b.SaveNodes())
+
+	dst4 := &stubNodesTable{}
+	n4, err := loadNodes(dst4, path, false)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n4)
+
+	dst6 := &stubNodesTable{}
+	n6, err := loadNodes(dst6, deriveV6Path(path), true)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n6)
 }

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	bencode "github.com/jackpal/bencode-go"
-	"github.com/nictuku/dht"
 )
 
 type TrackerResponse struct {
@@ -153,7 +152,7 @@ func trackerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	infoHash := dht.InfoHash(r.FormValue("info_hash"))
+	infoHash := r.FormValue("info_hash")
 	if len(infoHash) != 20 {
 		http.Error(w, "Bad info_hash.", 400)
 		return
@@ -165,13 +164,13 @@ func trackerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if *poolTTL > 0 {
-		recordAnnounce(r, string(infoHash))
+		recordAnnounce(r, infoHash)
 	}
 
-	peers, ok := peerCache.Get(string(infoHash))
+	peers, ok := peerCache.Get(infoHash)
 
 	var ih [20]byte
-	copy(ih[:], string(infoHash))
+	copy(ih[:], infoHash)
 	dhtNode.Request(ih)
 
 	if !ok || len(peers) == 0 {
@@ -180,7 +179,7 @@ func trackerHandler(w http.ResponseWriter, r *http.Request) {
 
 		time.Sleep(5 * time.Second)
 
-		peers, ok = peerCache.Get(string(infoHash))
+		peers, ok = peerCache.Get(infoHash)
 	}
 
 	if ok && len(peers) > 0 {

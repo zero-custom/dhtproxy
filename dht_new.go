@@ -217,6 +217,8 @@ type newBackend struct {
 	stats          *backendStats
 	starter        traversalStarter
 	starter6       traversalStarter // nil when server6 is nil; same seam as v4.
+	nodesFile      string           // "" = persistence disabled, zero behavior change.
+	saveStop       chan struct{}    // nil unless the 15min save sweeper runs.
 
 	mu           sync.Mutex
 	active       map[[20]byte]struct{}
@@ -230,8 +232,12 @@ func (b *newBackend) Name() string { return "new" }
 // NewNewBackend starts an anacrolix DHT server on the given UDP port
 // (0 = ephemeral) with the library's default bootstrap nodes and table
 // maintenance. TableMaintainer bootstraps on its own, so no explicit
-// Bootstrap call is needed.
-func NewNewBackend(port int, requestTimeout time.Duration, c *peercache.Cache) (*newBackend, error) {
+// Bootstrap call is needed. nodesFile is the v4 routing-table persist path
+// ("" disables persistence); the v6 path derives a .v6 suffix. When set,
+// file nodes load into the tables before either TableMaintainer starts, so
+// the first bootstrap already uses them, and a sweeper re-saves every
+// nodeSaveInterval.
+func NewNewBackend(port int, requestTimeout time.Duration, c *peercache.Cache, nodesFile string) (*newBackend, error) {
 	conn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		return nil, fmt.Errorf("new DHT backend: listen udp :%d: %w", port, err)
@@ -250,6 +256,7 @@ func NewNewBackend(port int, requestTimeout time.Duration, c *peercache.Cache) (
 		server:         srv,
 		cache:          c,
 		requestTimeout: requestTimeout,
+		nodesFile:      nodesFile,
 		active:         make(map[[20]byte]struct{}),
 		sem:            make(chan struct{}, maxConcurrentNewTraversals),
 	}
@@ -260,8 +267,6 @@ func NewNewBackend(port int, requestTimeout time.Duration, c *peercache.Cache) (
 	log.Printf("new DHT backend started port=%d requestTimeout=%s maxTraversals=%d",
 		port, b.effectiveTimeout(), maxConcurrentNewTraversals)
 
-	go srv.TableMaintainer()
-
 	// DHT6 (Variant A: second Server): degrade to v4-only when there is no
 	// IPv6 socket or no AAAA bootstrap. One line at startup, never fatal,
 	// never per-request; v4 behavior stays byte-identical.
@@ -271,7 +276,31 @@ func NewNewBackend(port int, requestTimeout time.Duration, c *peercache.Cache) (
 		b.server6 = srv6
 		b.starter6 = b.startRealTraversal6
 		log.Printf("new DHT backend: DHT6 enabled addr=%s", srv6.Addr())
-		go srv6.TableMaintainer()
+	}
+
+	// Persisted routing tables load BEFORE either TableMaintainer starts so
+	// the first bootstrap already uses file nodes. Empty path = disabled,
+	// zero behavior change.
+	if nodesFile != "" {
+		n4, err := loadNodes(srv, nodesFile, false)
+		if err != nil {
+			log.Print("new DHT backend: load nodes v4: ", err)
+		}
+		n6 := 0
+		if b.server6 != nil {
+			var err6 error
+			n6, err6 = loadNodes(b.server6, deriveV6Path(nodesFile), true)
+			if err6 != nil {
+				log.Print("new DHT backend: load nodes v6: ", err6)
+			}
+		}
+		log.Printf("new DHT backend: loaded nodes v4=%d v6=%d", n4, n6)
+		b.startNodeSaver()
+	}
+
+	go srv.TableMaintainer()
+	if b.server6 != nil {
+		go b.server6.TableMaintainer()
 	}
 
 	return b, nil
@@ -431,10 +460,61 @@ func (b *newBackend) logTraversalErr(err error, v6 bool) {
 	}
 }
 
+// SaveNodes persists the v4 (and v6, when present) routing tables,
+// best-effort: first error returned for the caller to log, never fatal.
+// No-op when persistence is disabled (empty nodesFile).
+func (b *newBackend) SaveNodes() error {
+	if b.nodesFile == "" {
+		return nil
+	}
+	var firstErr error
+	if b.server != nil {
+		if err := saveNodesAtomic(b.server, b.nodesFile); err != nil {
+			firstErr = err
+		}
+	}
+	if b.server6 != nil {
+		if err := saveNodesAtomic(b.server6, deriveV6Path(b.nodesFile)); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// startNodeSaver launches the periodic routing-table persist loop in its
+// own goroutine (backendStats-style ticker + stop channel, not shared with
+// the stats loop). Failures only warn; the request path never blocks on it.
+func (b *newBackend) startNodeSaver() {
+	stop := make(chan struct{})
+	b.saveStop = stop
+	go b.nodeSaveLoop(stop)
+}
+
+func (b *newBackend) nodeSaveLoop(stop <-chan struct{}) {
+	t := time.NewTicker(nodeSaveInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			if err := b.SaveNodes(); err != nil {
+				log.Print("new DHT backend: save nodes: ", err)
+			} else {
+				log.Printf("new DHT backend: saved nodes file=%s", b.nodesFile)
+			}
+		case <-stop:
+			return
+		}
+	}
+}
+
 func (b *newBackend) Close() error {
 	if b.stats != nil {
 		b.stats.close()
 		b.stats = nil
+	}
+	if b.saveStop != nil {
+		close(b.saveStop)
+		b.saveStop = nil
 	}
 	// NOTE: server pointers are intentionally NOT nilled. In-flight
 	// lookups read b.server/b.server6 via the starter methods without
@@ -450,58 +530,4 @@ func (b *newBackend) Close() error {
 		b.server6.Close()
 	}
 	return nil
-}
-
-// bothBackend fans one Request out to two backends. Both write into the
-// same shared peercache (dedupe inside Add), so merge semantics are
-// unchanged; per-backend stats lines tell old/new apart.
-type bothBackend struct {
-	a, b PeerBackend
-}
-
-func (m *bothBackend) Name() string { return "both" }
-
-func (m *bothBackend) Request(ih [20]byte) {
-	m.a.Request(ih)
-	m.b.Request(ih)
-}
-
-func (m *bothBackend) Close() error {
-	errA := m.a.Close()
-	errB := m.b.Close()
-	switch {
-	case errA != nil && errB != nil:
-		return fmt.Errorf("close both backends: old: %v, new: %v", errA, errB)
-	case errA != nil:
-		return fmt.Errorf("close old backend: %w", errA)
-	case errB != nil:
-		return fmt.Errorf("close new backend: %w", errB)
-	default:
-		return nil
-	}
-}
-
-// newPeerBackend builds the backend selected by --dhtBackend. In both mode
-// the old backend keeps the configured UDP port and the new backend takes
-// an ephemeral one, since only one socket can own a port.
-func newPeerBackend(mode string, port, numTargetPeers int, resetInterval, requestTimeout time.Duration, c *peercache.Cache) (PeerBackend, error) {
-	switch mode {
-	case "old":
-		return NewOldBackend(port, numTargetPeers, resetInterval, requestTimeout, c)
-	case "new":
-		return NewNewBackend(port, requestTimeout, c)
-	case "both":
-		old, err := NewOldBackend(port, numTargetPeers, resetInterval, requestTimeout, c)
-		if err != nil {
-			return nil, err
-		}
-		nb, err := NewNewBackend(0, requestTimeout, c)
-		if err != nil {
-			_ = old.Close()
-			return nil, err
-		}
-		return &bothBackend{a: old, b: nb}, nil
-	default:
-		return nil, fmt.Errorf("unknown --dhtBackend %q: want old|new|both", mode)
-	}
 }

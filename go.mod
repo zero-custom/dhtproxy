@@ -6,7 +6,6 @@ require (
 	github.com/anacrolix/dht/v2 v2.24.0
 	github.com/hashicorp/golang-lru v1.0.2
 	github.com/jackpal/bencode-go v1.0.1
-	github.com/nictuku/dht v0.0.0-20201226073453-fd1c1dd3d66a
 	github.com/stretchr/testify v1.9.0
 )
 
@@ -26,12 +25,9 @@ require (
 	github.com/bradfitz/iter v0.0.0-20191230175014-e8f45d346db8 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/edsrzf/mmap-go v1.1.0 // indirect
-	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/huandu/xstrings v1.3.2 // indirect
-	github.com/nictuku/nettools v0.0.0-20150117095333-8867a2107ad3 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rs/dnscache v0.0.0-20211102005908-e0241e321417 // indirect
-	github.com/youtube/vitess v2.1.1+incompatible // indirect
 	golang.org/x/exp v0.0.0-20221217163422-3c43f8badb15 // indirect
 	golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4 // indirect
 	golang.org/x/sys v0.6.0 // indirect

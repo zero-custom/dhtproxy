@@ -161,16 +161,23 @@ func TestTruncateSplitPeers(t *testing.T) {
 	}
 }
 
+// fakeBackend is a no-op PeerBackend so handler tests run without network.
+type fakeBackend struct{}
+
+func (f *fakeBackend) Name() string       { return "fake" }
+func (f *fakeBackend) Request(_ [20]byte) {}
+func (f *fakeBackend) Close() error       { return nil }
+
 // withTestGlobals swaps the server globals for an isolated cache and a
-// no-op DHT node (nil inner node makes Find a no-op), restoring both after
-// the test. It lets handler tests run without network.
+// no-op DHT backend, restoring both after the test. It lets handler tests
+// run without network.
 func withTestGlobals(t *testing.T) {
 	t.Helper()
 	oldCache, oldNode := peerCache, dhtNode
 	c, err := peercache.New(10, 200)
 	assert.NoError(t, err)
 	peerCache = c
-	dhtNode = &DhtNode{}
+	dhtNode = &fakeBackend{}
 	t.Cleanup(func() {
 		peerCache, dhtNode = oldCache, oldNode
 	})
