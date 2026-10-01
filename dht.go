@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/die-net/dhtproxy/peercache"
@@ -21,24 +22,58 @@ func init() {
 	dht.RegisterFlags(nil)
 }
 
-type DhtNode struct {
+// PeerBackend is the seam between the tracker frontend and DHT discovery.
+// Implementations trigger asynchronous lookups and drain compact peers
+// (6 bytes: IPv4 + big-endian port) into the shared peercache; results are
+// picked up by the tracker's cache poll. trackerHandler must only use this
+// interface, never a concrete backend or DHT library type.
+type PeerBackend interface {
+	// Name identifies the backend ("old", "new") for metrics and switches.
+	Name() string
+	// Request triggers one discovery round for ih. It must not block the
+	// caller and must never terminate the process on timeouts.
+	Request(ih [20]byte)
+	// Close stops background work.
+	Close() error
+}
+
+// oldBackend is the nictuku/dht implementation, kept 1:1 apart from the
+// fatal watchdogs (downgraded to warnings) so a replacement backend can
+// take over behind the PeerBackend interface.
+type oldBackend struct {
 	port           int
 	numTargetPeers int
+	requestTimeout time.Duration
 	node           *dht.DHT
 	c              *peercache.Cache
 	resetter       *time.Ticker
+	// requests counts Request calls; returnedPeers counts compact peers
+	// forwarded into the shared cache. Read with atomic.LoadInt64; the
+	// per-minute stats line reports both (see backendStats).
+	requests      int64
+	returnedPeers int64
+	stats         *backendStats
 }
 
-func NewDhtNode(port, numTargetPeers int, resetInterval time.Duration, c *peercache.Cache) (*DhtNode, error) {
-	d := &DhtNode{
+func (d *oldBackend) Name() string { return "old" }
+
+// DhtNode is kept as an alias so existing references keep compiling during
+// the migration; new code should use PeerBackend.
+type DhtNode = oldBackend
+
+func NewOldBackend(port, numTargetPeers int, resetInterval, requestTimeout time.Duration, c *peercache.Cache) (*oldBackend, error) {
+	d := &oldBackend{
 		port:           port,
 		numTargetPeers: numTargetPeers,
+		requestTimeout: requestTimeout,
 		c:              c,
 	}
 
 	if err := d.Reset(); err != nil {
 		return nil, err
 	}
+
+	d.stats = startBackendStats("old", &d.requests, &d.returnedPeers)
 
 	if resetInterval > 0 {
 		d.resetter = time.NewTicker(resetInterval)
@@ -48,7 +83,13 @@ func NewDhtNode(port, numTargetPeers int, resetInterval time.Duration, c *peerca
 	return d, nil
 }
 
-func (d *DhtNode) Reset() error {
+// NewDhtNode is kept as an alias during the migration; new code should
+// call NewOldBackend.
+func NewDhtNode(port, numTargetPeers int, resetInterval time.Duration, c *peercache.Cache) (*oldBackend, error) {
+	return NewOldBackend(port, numTargetPeers, resetInterval, time.Minute, c)
+}
+
+func (d *oldBackend) Reset() error {
 	d.stop()
 
 	conf := dht.NewConfig()
@@ -69,27 +110,37 @@ func (d *DhtNode) Reset() error {
 	return nil
 }
 
-func (d *DhtNode) doResets() {
+func (d *oldBackend) doResets() {
 	for range d.resetter.C {
 		if err := d.Reset(); err != nil {
-			log.Fatal("DHT reset failed: ", err)
+			log.Print("DHT reset failed (keeping old node): ", err)
 		}
 	}
 }
 
-func (d *DhtNode) drainResults(c *peercache.Cache) {
+func (d *oldBackend) drainResults(c *peercache.Cache) {
 	for r := range d.node.PeersRequestResults {
 		for ih, peers := range r {
+			atomic.AddInt64(&d.returnedPeers, int64(len(peers)))
 			c.Add(string(ih), peers)
 		}
 	}
 }
 
-func (d *DhtNode) Find(ih dht.InfoHash) {
+func (d *oldBackend) Request(ih [20]byte) {
+	atomic.AddInt64(&d.requests, 1)
+	d.Find(dht.InfoHash(string(ih[:])))
+}
+
+func (d *oldBackend) Find(ih dht.InfoHash) {
 	// TODO: This is still racy vs Reset()
 	if d.node != nil {
-		timer := time.AfterFunc(time.Minute, func() {
-			log.Fatal("d.node.PeersRequest() took longer than a minute.")
+		timeout := d.requestTimeout
+		if timeout <= 0 {
+			timeout = time.Minute
+		}
+		timer := time.AfterFunc(timeout, func() {
+			log.Print("d.node.PeersRequest() took longer than ", timeout, ".")
 		})
 		defer timer.Stop()
 
@@ -97,18 +148,31 @@ func (d *DhtNode) Find(ih dht.InfoHash) {
 	}
 }
 
-func (d *DhtNode) Stop() {
+func (d *oldBackend) Close() error {
+	d.Stop()
+	return nil
+}
+
+func (d *oldBackend) Stop() {
 	if d.resetter != nil {
 		d.resetter.Stop()
 		d.resetter = nil
 	}
+	if d.stats != nil {
+		d.stats.close()
+		d.stats = nil
+	}
 	d.stop()
 }
 
-func (d *DhtNode) stop() {
+func (d *oldBackend) stop() {
 	if d.node != nil {
-		timer := time.AfterFunc(time.Minute, func() {
-			log.Fatal("d.node.Stop() took longer than a minute.")
+		timeout := d.requestTimeout
+		if timeout <= 0 {
+			timeout = time.Minute
+		}
+		timer := time.AfterFunc(timeout, func() {
+			log.Print("d.node.Stop() took longer than ", timeout, ".")
 		})
 		defer timer.Stop()
 

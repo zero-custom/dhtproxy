@@ -11,17 +11,19 @@ import (
 )
 
 var (
-	listenAddr       = flag.String("listen", ":6969", "The [IP]:port to listen for incoming HTTP requests.")
-	debugAddr        = flag.String("debugListen", "", "The [IP]:port to listen for pprof HTTP requests. (\"\" = disable)")
-	dhtPortUDP       = flag.Int("dhtPortUDP", 0, "The UDP port number to use for DHT requests")
-	dhtResetInterval = flag.Duration("dhtResetInterval", time.Hour, "How often to reset the DHT client (0 = disable)")
-	targetNumPeers   = flag.Int("targetNumPeers", 8, "The number of DHT peers to try to find for a given node")
-	peerCacheSize    = flag.Int("peerCacheSize", 16384, "The max number of infohashes to keep a list of peers for.")
-	maxWant          = flag.Int("maxWant", 200, "The largest number of peers to return in one request.")
-	poolTTL          = flag.Duration("poolTTL", 30*time.Minute, "How long locally announced peers are kept (0 = disable the local pool, DHT-only behavior).")
+	listenAddr        = flag.String("listen", ":6969", "The [IP]:port to listen for incoming HTTP requests.")
+	debugAddr         = flag.String("debugListen", "", "The [IP]:port to listen for pprof HTTP requests. (\"\" = disable)")
+	dhtPortUDP        = flag.Int("dhtPortUDP", 0, "The UDP port number to use for DHT requests")
+	dhtResetInterval  = flag.Duration("dhtResetInterval", time.Hour, "How often to reset the DHT client (0 = disable)")
+	dhtRequestTimeout = flag.Duration("dhtRequestTimeout", time.Minute, "Per-request timeout for DHT discovery/Stop before logging a warning (never fatal)")
+	dhtBackend        = flag.String("dhtBackend", "old", "Which DHT backend to use: old (nictuku), new (anacrolix/dht), or both (dual-run, results merge in the shared cache).")
+	targetNumPeers    = flag.Int("targetNumPeers", 8, "The number of DHT peers to try to find for a given node")
+	peerCacheSize     = flag.Int("peerCacheSize", 16384, "The max number of infohashes to keep a list of peers for.")
+	maxWant           = flag.Int("maxWant", 200, "The largest number of peers to return in one request.")
+	poolTTL           = flag.Duration("poolTTL", 30*time.Minute, "How long locally announced peers are kept (0 = disable the local pool, DHT-only behavior).")
 
 	peerCache *peercache.Cache
-	dhtNode   *DhtNode
+	dhtNode   PeerBackend
 )
 
 func main() {
@@ -35,7 +37,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	dhtNode, err = NewDhtNode(*dhtPortUDP, *targetNumPeers, *dhtResetInterval, peerCache)
+	dhtNode, err = newPeerBackend(*dhtBackend, *dhtPortUDP, *targetNumPeers, *dhtResetInterval, *dhtRequestTimeout, peerCache)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -117,7 +117,9 @@ func trackerHandler(w http.ResponseWriter, r *http.Request) {
 
 	peers, ok := peerCache.Get(string(infoHash))
 
-	dhtNode.Find(infoHash)
+	var ih [20]byte
+	copy(ih[:], string(infoHash))
+	dhtNode.Request(ih)
 
 	if !ok || len(peers) == 0 {
 		response.Interval = 30
