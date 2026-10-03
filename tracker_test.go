@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/die-net/dhtproxy/peercache"
+	"github.com/zero-custom/dhtproxy/peercache"
 	bencode "github.com/jackpal/bencode-go"
 	"github.com/stretchr/testify/assert"
 )

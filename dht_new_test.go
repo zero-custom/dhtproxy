@@ -13,7 +13,7 @@ import (
 
 	adht "github.com/anacrolix/dht/v2"
 	"github.com/anacrolix/dht/v2/krpc"
-	"github.com/die-net/dhtproxy/peercache"
+	"github.com/zero-custom/dhtproxy/peercache"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

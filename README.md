@@ -1,11 +1,11 @@
-# dhtproxy [![Build Status](https://github.com/die-net/dhtproxy/actions/workflows/go-test.yml/badge.svg)](https://github.com/die-net/dhtproxy/actions/workflows/go-test.yml)  [![Coverage Status](https://coveralls.io/repos/github/die-net/dhtproxy/badge.svg?branch=main)](https://coveralls.io/github/die-net/dhtproxy?branch=main) [![Go Report Card](https://goreportcard.com/badge/github.com/die-net/dhtproxy)](https://goreportcard.com/report/github.com/die-net/dhtproxy)
+# dhtproxy [![Build Status](https://github.com/zero-custom/dhtproxy/actions/workflows/go-test.yml/badge.svg)](https://github.com/zero-custom/dhtproxy/actions/workflows/go-test.yml)  [![Coverage Status](https://coveralls.io/repos/github/zero-custom/dhtproxy/badge.svg?branch=main)](https://coveralls.io/github/zero-custom/dhtproxy?branch=main) [![Go Report Card](https://goreportcard.com/badge/github.com/zero-custom/dhtproxy)](https://goreportcard.com/report/github.com/zero-custom/dhtproxy)
 
 This is a proxy that accepts BitTorrent tracker [announce requests](https://wiki.theory.org/BitTorrent_Tracker_Protocol) over HTTP and converts them to [mainline DHT](https://en.wikipedia.org/wiki/Mainline_DHT) lookups.  This allows clients which are unable to use DHT to bootstrap some peers in a trackerless swarm, after which it can hopefully use [PeX](https://en.wikipedia.org/wiki/Peer_exchange) to find more.
 
 #### Usage
 
 * [Install Go](https://golang.org/doc/install) and set up your $GOPATH.
-* ```go get github.com/die-net/dhtproxy```
+* ```go get github.com/zero-custom/dhtproxy```
 * ```$GOPATH/bin/dhtproxy -listen=:6969```
 * In your BitTorrent client, add a tracker of http://127.0.0.1:6969/announce for any torrents that you'd like to use dhtproxy.
 

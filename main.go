@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/die-net/dhtproxy/peercache"
+	"github.com/zero-custom/dhtproxy/peercache"
 )
 
 var (

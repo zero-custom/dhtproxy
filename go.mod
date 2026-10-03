@@ -1,4 +1,4 @@
-module github.com/die-net/dhtproxy
+module github.com/zero-custom/dhtproxy
 
 go 1.26
 

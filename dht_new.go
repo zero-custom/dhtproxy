@@ -10,7 +10,7 @@ import (
 	"time"
 
 	adht "github.com/anacrolix/dht/v2"
-	"github.com/die-net/dhtproxy/peercache"
+	"github.com/zero-custom/dhtproxy/peercache"
 )
 
 // backendStats emits one cumulative log line per minute per backend
